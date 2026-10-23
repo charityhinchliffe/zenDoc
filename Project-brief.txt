@@ -1,0 +1,16 @@
+ZENDOC DEMO — PROJECT BRIEF
+============================
+
+Project: Quiet Vault
+Status: Prototype
+
+Goal:
+Create a simple document library where viewing an account and moving a file
+require separate credentials.
+
+Prototype scope:
+- Account login
+- Master-password file gate
+- Encrypted-at-rest product messaging
+
+This is a harmless demonstration file generated for the zenDoc interface.

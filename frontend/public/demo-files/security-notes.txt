@@ -1,0 +1,11 @@
+ZENDOC DEMO — SECURITY NOTES
+=============================
+
+Layer 1: Account credentials open the document library.
+Layer 2: A separate master password authorizes file operations.
+Layer 3: Server-side encryption protects stored files.
+
+Important:
+This frontend is a design prototype. Production authentication, password
+derivation, authorization, key management, audit logging, and encryption must
+be implemented and independently reviewed before storing real documents.
