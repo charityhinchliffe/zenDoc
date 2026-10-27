@@ -2,167 +2,282 @@
 
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { Wordmark } from "@/components/Wordmark";
 import {
-  clearDemoSession,
-  getDemoSession,
-  initialsFromName,
-  type DemoSession,
-} from "@/lib/demoSession";
+  ApiError,
+  deleteDocument,
+  downloadDocument,
+  getAccount,
+  listDocuments,
+  shareDocument,
+  shareUrl,
+  uploadDocument,
+  type DocumentList,
+  type LibraryView,
+  type VaultDocument,
+} from "@/lib/api";
+import { clearSession, getSession, initialsFromName, type AccountSession } from "@/lib/session";
 
-const MASTER_PASSWORD = "zen-demo";
+type GateAction = "download" | "share" | "delete";
+type UnlockPhase = "idle" | "error" | "checking" | "unlocking" | "done";
 
-type DemoFile = {
-  id: string;
-  name: string;
-  kind: string;
-  size: string;
-  updated: string;
-  href: string;
+type SelectedFile = {
+  file: VaultDocument;
+  action: GateAction;
 };
 
-const files: DemoFile[] = [
-  {
-    id: "board-minutes",
-    name: "Board-minutes.txt",
-    kind: "Text document",
-    size: "384 B",
-    updated: "Today, 09:42",
-    href: "/demo-files/board-minutes.txt",
-  },
-  {
-    id: "project-brief",
-    name: "Project-brief.txt",
-    kind: "Text document",
-    size: "412 B",
-    updated: "Yesterday, 16:18",
-    href: "/demo-files/project-brief.txt",
-  },
-  {
-    id: "security-notes",
-    name: "Security-notes.txt",
-    kind: "Text document",
-    size: "489 B",
-    updated: "20 Oct 2026",
-    href: "/demo-files/security-notes.txt",
-  },
+const views: { id: LibraryView; label: string }[] = [
+  { id: "all", label: "All documents" },
+  { id: "recent", label: "Recent" },
+  { id: "shared", label: "Shared" },
+  { id: "trash", label: "Trash" },
 ];
-
-type UnlockPhase = "idle" | "error" | "unlocking" | "decrypted";
 
 const wait = (milliseconds: number) =>
   new Promise((resolve) => window.setTimeout(resolve, milliseconds));
 
 export function Dashboard() {
   const router = useRouter();
-  const [session, setSession] = useState<DemoSession | null>(null);
+  const uploadInput = useRef<HTMLInputElement>(null);
+  const [session, setSession] = useState<AccountSession | null>(null);
+  const [view, setView] = useState<LibraryView>("all");
+  const [library, setLibrary] = useState<DocumentList | null>(null);
+  const [libraryError, setLibraryError] = useState("");
+  const [loadingLibrary, setLoadingLibrary] = useState(true);
+  const [refreshKey, setRefreshKey] = useState(0);
   const [query, setQuery] = useState("");
-  const [selectedFile, setSelectedFile] = useState<DemoFile | null>(null);
+  const [uploading, setUploading] = useState(false);
+  const [uploadError, setUploadError] = useState("");
+  const [selected, setSelected] = useState<SelectedFile | null>(null);
   const [masterPassword, setMasterPassword] = useState("");
   const [phase, setPhase] = useState<UnlockPhase>("idle");
+  const [gateError, setGateError] = useState("");
   const [filledBoxes, setFilledBoxes] = useState(0);
+  const [sharedLink, setSharedLink] = useState("");
+  const [copied, setCopied] = useState(false);
+  const [readyDownload, setReadyDownload] = useState<{ blob: Blob; filename: string } | null>(null);
 
   useEffect(() => {
-    const current = getDemoSession();
+    const current = getSession();
     if (!current) {
       router.replace("/login");
       return;
     }
-    setSession(current);
+
+    let cancelled = false;
+    getAccount(current.accessToken)
+      .then((account) => {
+        if (cancelled) return;
+        setSession({
+          ...current,
+          id: account.id,
+          email: account.email,
+          fullName: account.full_name,
+        });
+      })
+      .catch((caught) => {
+        if (cancelled) return;
+        if (caught instanceof ApiError && caught.status === 401) {
+          clearSession();
+          router.replace("/login");
+          return;
+        }
+        setSession(current);
+        setLibraryError(caught instanceof Error ? caught.message : "Could not open the library.");
+        setLoadingLibrary(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
   }, [router]);
 
+  useEffect(() => {
+    if (!session) return;
+    let cancelled = false;
+    setLoadingLibrary(true);
+    listDocuments(session.accessToken, view)
+      .then((result) => {
+        if (cancelled) return;
+        setLibrary(result);
+        setLibraryError("");
+      })
+      .catch((caught) => {
+        if (cancelled) return;
+        if (caught instanceof ApiError && caught.status === 401) {
+          clearSession();
+          router.replace("/login");
+          return;
+        }
+        setLibraryError(caught instanceof Error ? caught.message : "Could not load documents.");
+      })
+      .finally(() => {
+        if (!cancelled) setLoadingLibrary(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [session, view, refreshKey, router]);
+
+  const documents = library?.documents ?? [];
   const filteredFiles = useMemo(
-    () =>
-      files.filter((file) =>
-        file.name.toLocaleLowerCase().includes(query.toLocaleLowerCase()),
-      ),
-    [query],
+    () => documents.filter((file) => file.name.toLocaleLowerCase().includes(query.toLocaleLowerCase())),
+    [documents, query],
   );
 
   useEffect(() => {
-    if (!selectedFile) return;
+    if (!selected) return;
 
     const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && phase !== "unlocking") {
-        setSelectedFile(null);
-        setMasterPassword("");
-        setPhase("idle");
-        setFilledBoxes(0);
-      }
+      if (event.key === "Escape" && phase !== "unlocking" && phase !== "checking") closeUnlock();
     };
 
     document.body.style.overflow = "hidden";
     window.addEventListener("keydown", closeOnEscape);
-
     return () => {
       document.body.style.overflow = "";
       window.removeEventListener("keydown", closeOnEscape);
     };
-  }, [selectedFile, phase]);
+  }, [selected, phase]);
 
-  const openUnlock = (file: DemoFile) => {
-    setSelectedFile(file);
+  const openUnlock = (file: VaultDocument, action: GateAction) => {
+    setSelected({ file, action });
     setMasterPassword("");
     setPhase("idle");
+    setGateError("");
     setFilledBoxes(0);
+    setSharedLink("");
+    setCopied(false);
+    setReadyDownload(null);
   };
 
   const closeUnlock = () => {
-    if (phase === "unlocking") return;
-    setSelectedFile(null);
+    if (phase === "unlocking" || phase === "checking") return;
+    setSelected(null);
     setMasterPassword("");
     setPhase("idle");
+    setGateError("");
     setFilledBoxes(0);
+    setSharedLink("");
+    setCopied(false);
+    setReadyDownload(null);
   };
 
-  const downloadFile = async (file: DemoFile) => {
-    const response = await fetch(file.href);
-    const blob = await response.blob();
+  const saveBlob = (blob: Blob, filename: string) => {
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement("a");
     anchor.href = url;
-    anchor.download = file.name;
+    anchor.download = filename;
     document.body.appendChild(anchor);
     anchor.click();
     anchor.remove();
     window.setTimeout(() => URL.revokeObjectURL(url), 1000);
   };
 
-  const unlockAndDownload = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    if (!selectedFile || phase === "unlocking") return;
+  const runGate = async (action: GateAction, file: VaultDocument, password: string) => {
+    if (!session) throw new ApiError(401, "Not authenticated");
+    if (action === "download") {
+      const result = await downloadDocument(session.accessToken, file.id, password);
+      return { blob: result.blob, filename: result.filename || file.name };
+    }
+    if (action === "share") {
+      const result = await shareDocument(session.accessToken, file.id, password);
+      setSharedLink(shareUrl(result.path));
+      setRefreshKey((value) => value + 1);
+      return null;
+    }
+    await deleteDocument(session.accessToken, file.id, password);
+    setRefreshKey((value) => value + 1);
+    return null;
+  };
 
-    if (phase === "decrypted") {
-      await downloadFile(selectedFile);
+  const unlock = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!selected || phase === "unlocking" || phase === "checking") return;
+
+    if (phase === "done") {
+      if (selected.action === "download" && readyDownload) {
+        saveBlob(readyDownload.blob, readyDownload.filename);
+      }
+      if (selected.action === "share" && sharedLink) {
+        await navigator.clipboard.writeText(sharedLink);
+        setCopied(true);
+      }
       return;
     }
 
-    if (masterPassword !== MASTER_PASSWORD) {
+    setPhase("checking");
+    setGateError("");
+    setFilledBoxes(0);
+    try {
+      const download = await runGate(selected.action, selected.file, masterPassword);
+      setPhase("unlocking");
+      for (let box = 1; box <= 8; box += 1) {
+        await wait(140);
+        setFilledBoxes(box);
+      }
+      if (download) {
+        setReadyDownload(download);
+        saveBlob(download.blob, download.filename);
+      }
+      setPhase("done");
+      if (selected.action === "delete") {
+        await wait(500);
+        setSelected(null);
+        setPhase("idle");
+        setMasterPassword("");
+      }
+    } catch (caught) {
       setPhase("error");
       setFilledBoxes(0);
-      return;
+      setGateError(caught instanceof Error ? caught.message : "Incorrect master password.");
     }
+  };
 
-    setPhase("unlocking");
-    setFilledBoxes(0);
-
-    for (let box = 1; box <= 8; box += 1) {
-      await wait(140);
-      setFilledBoxes(box);
+  const uploadFile = async (file: File | undefined) => {
+    if (!file || !session) return;
+    setUploading(true);
+    setUploadError("");
+    try {
+      await uploadDocument(session.accessToken, file);
+      setView("all");
+      setRefreshKey((value) => value + 1);
+    } catch (caught) {
+      if (caught instanceof ApiError && caught.status === 401) {
+        clearSession();
+        router.replace("/login");
+        return;
+      }
+      setUploadError(caught instanceof Error ? caught.message : "Upload failed.");
+    } finally {
+      setUploading(false);
+      if (uploadInput.current) uploadInput.current.value = "";
     }
-
-    setPhase("decrypted");
-    await wait(720);
-    await downloadFile(selectedFile);
   };
 
   const logOut = () => {
-    clearDemoSession();
+    clearSession();
     router.push("/login");
   };
 
-  if (!session) return null;
+  if (!session) {
+    return (
+      <div className="dashboard-page">
+        <p className="library-status">Opening vault…</p>
+      </div>
+    );
+  }
+
+  const used = library?.storage_used_bytes ?? 0;
+  const quota = library?.storage_quota_bytes ?? 5 * 1024 * 1024 * 1024;
+  const usedPercent = quota > 0 ? Math.min(100, (used / quota) * 100) : 0;
+  const viewLabel = views.find((item) => item.id === view)?.label ?? "All documents";
+  const gateTitle =
+    selected?.action === "share" ? "Unlock share" : selected?.action === "delete" ? "Unlock delete" : "Unlock download";
+  const gateVerb =
+    selected?.action === "share" ? "Sharing…" : selected?.action === "delete" ? "Deleting…" : "Decrypting…";
 
   return (
     <div className="dashboard-page">
@@ -189,7 +304,7 @@ export function Dashboard() {
               Vault online
             </span>
             <span className="avatar" aria-hidden="true">
-              {initialsFromName(session.name)}
+              {initialsFromName(session.fullName)}
             </span>
             <button className="dashboard-logout" type="button" onClick={logOut}>
               Log out
@@ -202,34 +317,34 @@ export function Dashboard() {
         <aside className="dashboard-sidebar" aria-label="Dashboard navigation">
           <p className="sidebar-label">Workspace</p>
           <nav>
-            <a className="is-current" href="#documents">
-              <GridIcon />
-              All documents
-              <span>3</span>
-            </a>
-            <a href="#recent">
-              <ClockIcon />
-              Recent
-            </a>
-            <a href="#shared">
-              <ShareIcon />
-              Shared
-            </a>
-            <a href="#trash">
-              <TrashIcon />
-              Trash
-            </a>
+            {views.map((item) => (
+              <button
+                key={item.id}
+                type="button"
+                className={item.id === view ? "is-current" : undefined}
+                onClick={() => setView(item.id)}
+              >
+                {item.id === "all" ? <GridIcon /> : null}
+                {item.id === "recent" ? <ClockIcon /> : null}
+                {item.id === "shared" ? <ShareIcon /> : null}
+                {item.id === "trash" ? <TrashIcon /> : null}
+                {item.label}
+                {item.id === view ? <span>{documents.length}</span> : null}
+              </button>
+            ))}
           </nav>
 
           <div className="storage-meter">
             <div>
               <span>Storage</span>
-              <b>1.3 KB / 5 GB</b>
+              <b>
+                {formatBytes(used)} / {formatBytes(quota)}
+              </b>
             </div>
             <i>
-              <span />
+              <span style={{ width: `${used > 0 ? Math.max(usedPercent, 1) : 0}%` }} />
             </i>
-            <p>Your encrypted vault has plenty of room.</p>
+            <p>{used === 0 ? "Your encrypted vault is empty." : "Your encrypted vault has room."}</p>
           </div>
         </aside>
 
@@ -241,15 +356,30 @@ export function Dashboard() {
                 Private library
               </p>
               <h1>Your documents</h1>
-              <p>
-                Signed in as {session.email}. Every download waits behind the
-                master password.
-              </p>
+              <p>Signed in as {session.email}. Download, share, and delete wait behind the master password.</p>
             </div>
-            <button className="btn btn-primary upload-button" type="button">
-              <PlusIcon />
-              Upload file
-            </button>
+            <div className="upload-control">
+              <input
+                ref={uploadInput}
+                type="file"
+                hidden
+                onChange={(event) => uploadFile(event.target.files?.[0])}
+              />
+              <button
+                className="btn btn-primary upload-button"
+                type="button"
+                disabled={uploading}
+                onClick={() => uploadInput.current?.click()}
+              >
+                <PlusIcon />
+                {uploading ? "Uploading…" : "Upload file"}
+              </button>
+              {uploadError ? (
+                <p className="auth-error" role="alert">
+                  {uploadError}
+                </p>
+              ) : null}
+            </div>
           </div>
 
           <section className="dashboard-stats" aria-label="Vault summary">
@@ -258,8 +388,8 @@ export function Dashboard() {
                 <FileIcon />
               </span>
               <div>
-                <strong>3</strong>
-                <p>Encrypted files</p>
+                <strong>{documents.length}</strong>
+                <p>{view === "trash" ? "In trash" : view === "shared" ? "Shared files" : "Encrypted files"}</p>
               </div>
             </article>
             <article>
@@ -273,24 +403,43 @@ export function Dashboard() {
             </article>
             <article className="password-hint">
               <div>
-                <p>Demo master password</p>
-                <code>{MASTER_PASSWORD}</code>
+                <p>Master password</p>
+                <strong className="gate-rule">Download, share, and delete</strong>
               </div>
-              <span>Use this for every sample file</span>
+              <span>Your account password cannot open these.</span>
             </article>
           </section>
 
-          <section className="documents-panel glass" id="recent">
+          <div className="library-switch" role="tablist" aria-label="Library views">
+            {views.map((item) => (
+              <button
+                key={item.id}
+                type="button"
+                className={item.id === view ? "is-current" : undefined}
+                onClick={() => setView(item.id)}
+              >
+                {item.label}
+              </button>
+            ))}
+          </div>
+
+          <section className="documents-panel glass" id={view}>
             <header>
               <div>
-                <h2>All documents</h2>
-                <p>{filteredFiles.length} sealed files</p>
+                <h2>{viewLabel}</h2>
+                <p>
+                  {loadingLibrary
+                    ? "Loading documents…"
+                    : `${filteredFiles.length} ${view === "trash" ? "trashed" : "sealed"} files`}
+                </p>
               </div>
-              <button type="button" className="filter-button">
-                <FilterIcon />
-                Filter
-              </button>
             </header>
+
+            {libraryError ? (
+              <p className="empty-files" role="alert">
+                {libraryError}
+              </p>
+            ) : null}
 
             <div className="documents-table" role="table" aria-label="Documents">
               <div className="document-row document-heading" role="row">
@@ -314,33 +463,65 @@ export function Dashboard() {
                       <span>{file.kind}</span>
                     </div>
                   </div>
-                  <span role="cell">{file.updated}</span>
-                  <span role="cell">{file.size}</span>
+                  <span role="cell">{formatUpdated(file.updated_at)}</span>
+                  <span role="cell">{formatBytes(file.size_bytes)}</span>
                   <span role="cell" className="encrypted-badge">
                     <LockIcon />
                     Encrypted
                   </span>
-                  <button
-                    type="button"
-                    className="download-button"
-                    onClick={() => openUnlock(file)}
-                    aria-label={`Download ${file.name}`}
-                  >
-                    <DownloadIcon />
-                    Download
-                  </button>
+                  <div className="row-actions" role="cell">
+                    <button
+                      type="button"
+                      className="download-button"
+                      onClick={() => openUnlock(file, "download")}
+                      aria-label={`Download ${file.name}`}
+                    >
+                      <DownloadIcon />
+                      <span className="action-label">Download</span>
+                    </button>
+                    {view !== "trash" ? (
+                      <>
+                        <button
+                          type="button"
+                          className="download-button"
+                          onClick={() => openUnlock(file, "share")}
+                          aria-label={`Share ${file.name}`}
+                        >
+                          <ShareIcon />
+                          <span className="action-label">Share</span>
+                        </button>
+                        <button
+                          type="button"
+                          className="download-button"
+                          onClick={() => openUnlock(file, "delete")}
+                          aria-label={`Delete ${file.name}`}
+                        >
+                          <TrashIcon />
+                          <span className="action-label">Delete</span>
+                        </button>
+                      </>
+                    ) : null}
+                  </div>
                 </div>
               ))}
 
-              {filteredFiles.length === 0 ? (
-                <p className="empty-files">No documents match “{query}”.</p>
+              {!loadingLibrary && filteredFiles.length === 0 ? (
+                <p className="empty-files">
+                  {query
+                    ? `No documents match “${query}”.`
+                    : view === "trash"
+                      ? "Trash is empty."
+                      : view === "shared"
+                        ? "No shared documents yet."
+                        : "Upload a file to start your library."}
+                </p>
               ) : null}
             </div>
           </section>
         </main>
       </div>
 
-      {selectedFile ? (
+      {selected ? (
         <div
           className="unlock-overlay"
           role="presentation"
@@ -358,7 +539,7 @@ export function Dashboard() {
               type="button"
               className="unlock-close"
               onClick={closeUnlock}
-              disabled={phase === "unlocking"}
+              disabled={phase === "unlocking" || phase === "checking"}
               aria-label="Close"
             >
               ×
@@ -366,13 +547,11 @@ export function Dashboard() {
 
             <p className="gate-kicker">Master password</p>
             <h2 className="gate-title" id="unlock-title">
-              Unlock download
+              {gateTitle}
             </h2>
-            <p>
-              {selectedFile.name} stays sealed until this password is entered.
-            </p>
+            <p>{selected.file.name} stays sealed until this password is entered.</p>
 
-            <form onSubmit={unlockAndDownload}>
+            <form onSubmit={unlock}>
               <label className="unlock-input-label">
                 <span>Master password</span>
                 <input
@@ -384,34 +563,45 @@ export function Dashboard() {
                   }}
                   autoFocus
                   autoComplete="off"
-                  placeholder="zen-demo"
-                  disabled={phase === "unlocking" || phase === "decrypted"}
+                  placeholder="Master password"
+                  disabled={phase === "unlocking" || phase === "checking" || phase === "done"}
                 />
               </label>
 
-              {phase === "unlocking" || phase === "decrypted" ? (
-                <div
-                  className="pin unlock-pin"
-                  aria-label={`${filledBoxes} of 8 decryption steps complete`}
-                >
+              {phase === "unlocking" || phase === "done" ? (
+                <div className="pin unlock-pin" aria-label={`${filledBoxes} of 8 decryption steps complete`}>
                   {Array.from({ length: 8 }, (_, index) => (
-                    <i
-                      key={index}
-                      className={index < filledBoxes ? "is-filled" : undefined}
-                    />
+                    <i key={index} className={index < filledBoxes ? "is-filled" : undefined} />
                   ))}
                 </div>
               ) : null}
 
+              {phase === "done" && selected.action === "share" && sharedLink ? (
+                <label className="share-result">
+                  <span>Share link</span>
+                  <input readOnly value={sharedLink} onFocus={(event) => event.currentTarget.select()} />
+                </label>
+              ) : null}
+
               <div className="unlock-feedback" aria-live="polite">
-                {phase === "error" ? (
-                  <p className="unlock-error">Incorrect master password. Try zen-demo.</p>
-                ) : null}
-                {phase === "unlocking" ? <p>Decrypting file…</p> : null}
-                {phase === "decrypted" ? (
+                {phase === "error" ? <p className="unlock-error">{gateError}</p> : null}
+                {phase === "unlocking" ? <p>{gateVerb}</p> : null}
+                {phase === "done" && selected.action === "download" ? (
                   <p className="unlock-success">
                     <CheckIcon />
                     File decrypted
+                  </p>
+                ) : null}
+                {phase === "done" && selected.action === "share" ? (
+                  <p className="unlock-success">
+                    <CheckIcon />
+                    {copied ? "Link copied" : "Share link ready"}
+                  </p>
+                ) : null}
+                {phase === "done" && selected.action === "delete" ? (
+                  <p className="unlock-success">
+                    <CheckIcon />
+                    Moved to trash
                   </p>
                 ) : null}
               </div>
@@ -419,13 +609,24 @@ export function Dashboard() {
               <button
                 className="btn btn-primary unlock-submit"
                 type="submit"
-                disabled={phase === "unlocking" || (!masterPassword && phase !== "decrypted")}
+                disabled={
+                  phase === "unlocking" ||
+                  phase === "checking" ||
+                  (phase !== "done" && !masterPassword) ||
+                  (phase === "done" && selected.action === "delete")
+                }
               >
-                {phase === "unlocking"
-                  ? "Decrypting…"
-                  : phase === "decrypted"
-                    ? "Download again"
-                    : "Confirm password"}
+                {phase === "checking"
+                  ? "Checking…"
+                  : phase === "unlocking"
+                  ? gateVerb
+                  : phase === "done" && selected.action === "share"
+                    ? "Copy link"
+                    : phase === "done" && selected.action === "download"
+                      ? "Download again"
+                      : phase === "done"
+                        ? "Done"
+                        : "Confirm password"}
               </button>
             </form>
           </section>
@@ -433,6 +634,30 @@ export function Dashboard() {
       ) : null}
     </div>
   );
+}
+
+function formatBytes(bytes: number) {
+  const units = ["B", "KB", "MB", "GB"];
+  let value = bytes;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  const shown = unit === 0 || value >= 10 ? value.toFixed(unit === 0 ? 0 : 0) : value.toFixed(1);
+  return `${shown} ${units[unit]}`;
+}
+
+function formatUpdated(value: string) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  const time = date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
+  const today = new Date();
+  const yesterday = new Date();
+  yesterday.setDate(today.getDate() - 1);
+  if (date.toDateString() === today.toDateString()) return `Today, ${time}`;
+  if (date.toDateString() === yesterday.toDateString()) return `Yesterday, ${time}`;
+  return date.toLocaleDateString([], { day: "numeric", month: "short", year: "numeric" });
 }
 
 function SearchIcon() {
@@ -513,14 +738,6 @@ function PlusIcon() {
   return (
     <svg viewBox="0 0 24 24" aria-hidden="true">
       <path d="M12 5v14M5 12h14" />
-    </svg>
-  );
-}
-
-function FilterIcon() {
-  return (
-    <svg viewBox="0 0 24 24" aria-hidden="true">
-      <path d="M4 6h16M7 12h10M10 18h4" />
     </svg>
   );
 }
