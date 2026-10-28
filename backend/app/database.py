@@ -35,4 +35,6 @@ def init_db() -> None:
     from app import models  # noqa: F401
 
     DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    DATABASE_PATH.touch(exist_ok=True)
+    print(f"Opening SQLite database at {DATABASE_PATH}", flush=True)
     Base.metadata.create_all(bind=engine)

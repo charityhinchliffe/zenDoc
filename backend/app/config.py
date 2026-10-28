@@ -14,23 +14,35 @@ STORAGE_QUOTA_BYTES = 5 * 1024 * 1024 * 1024
 
 
 def _on_vercel() -> bool:
-    return os.getenv("VERCEL") == "1"
+    return os.getenv("VERCEL") == "1" or bool(os.getenv("VERCEL_ENV"))
 
 
-def _resolve_path(env_name: str, local_default: Path, vercel_default: Path) -> Path:
+def _can_write(directory: Path) -> bool:
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        probe = directory / ".write-probe"
+        probe.write_text("ok")
+        probe.unlink()
+        return True
+    except OSError:
+        return False
+
+
+def _writable_path(env_name: str, local_default: Path, temporary_default: Path) -> Path:
     raw = os.getenv(env_name)
-    if not raw:
-        return vercel_default if _on_vercel() else local_default
-    path = Path(raw)
-    if path.is_absolute():
-        return path
-    # Vercel’s deployment directory is read-only. Relative files have to live in /tmp.
-    base = Path("/tmp") if _on_vercel() else BASE_DIR
-    return base / path
+    candidate = Path(raw) if raw else local_default
+    if not candidate.is_absolute():
+        candidate = BASE_DIR / candidate
+    if _on_vercel() or not _can_write(candidate.parent):
+        temporary_default.parent.mkdir(parents=True, exist_ok=True)
+        if temporary_default.suffix:
+            temporary_default.touch(exist_ok=True)
+        return temporary_default
+    return candidate
 
 
-DATABASE_PATH = _resolve_path("DATABASE_PATH", BASE_DIR / "zendoc.db", Path("/tmp/zendoc.db"))
-MEDIA_ROOT = _resolve_path(
+DATABASE_PATH = _writable_path("DATABASE_PATH", BASE_DIR / "zendoc.db", Path("/tmp/zendoc.db"))
+MEDIA_ROOT = _writable_path(
     "MEDIA_ROOT",
     BASE_DIR / "media" / "static",
     Path("/tmp/media/static"),
