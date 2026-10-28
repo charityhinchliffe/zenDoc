@@ -1,6 +1,16 @@
 import type { AccountSession } from "@/lib/session";
 
-export const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8000";
+const PUBLIC_API_PREFIX = "/api";
+
+function serviceUrl(path: string) {
+  const normalized = path.startsWith("/") ? path : `/${path}`;
+  const bound = process.env.BACKEND_URL;
+  if (typeof window === "undefined" && bound) {
+    const base = bound.endsWith("/") ? bound : `${bound}/`;
+    return new URL(normalized.slice(1), base).toString();
+  }
+  return `${PUBLIC_API_PREFIX}${normalized}`;
+}
 
 export class ApiError extends Error {
   status: number;
@@ -123,7 +133,10 @@ export function deleteDocument(token: string, documentId: number, masterPassword
 }
 
 export function shareUrl(path: string) {
-  return `${API_URL}${path}`;
+  const normalized = path.startsWith("/") ? path : `/${path}`;
+  const publicPath = `${PUBLIC_API_PREFIX}${normalized}`;
+  if (typeof window === "undefined") return publicPath;
+  return `${window.location.origin}${publicPath}`;
 }
 
 async function request<T>(path: string, options: RequestInit, token?: string): Promise<T> {
@@ -156,7 +169,7 @@ async function send(path: string, options: RequestInit, token?: string) {
 
   let response: Response;
   try {
-    response = await fetch(`${API_URL}${path}`, { ...options, headers });
+    response = await fetch(serviceUrl(path), { ...options, headers });
   } catch {
     throw new ApiError(0, "Could not reach the zenDoc server.");
   }
