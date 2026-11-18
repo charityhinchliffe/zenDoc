@@ -16,7 +16,26 @@ async def lifespan(_app: FastAPI):
     yield
 
 
+class StripPublicApiPrefix:
+    """Vercel routes /api/* to this service with the prefix still on the path."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] in ("http", "websocket"):
+            path = scope.get("path") or ""
+            if path == "/api" or path.startswith("/api/"):
+                stripped = path[len("/api") :] or "/"
+                scope = dict(scope)
+                scope["path"] = stripped
+                if isinstance(scope.get("raw_path"), (bytes, bytearray)):
+                    scope["raw_path"] = stripped.encode()
+        await self.app(scope, receive, send)
+
+
 app = FastAPI(title="zenDoc API", lifespan=lifespan)
+app.add_middleware(StripPublicApiPrefix)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
