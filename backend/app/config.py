@@ -41,7 +41,6 @@ def _writable_path(env_name: str, local_default: Path, temporary_default: Path) 
     return candidate
 
 
-DATABASE_PATH = _writable_path("DATABASE_PATH", BASE_DIR / "zendoc.db", Path("/tmp/zendoc.db"))
 MEDIA_ROOT = _writable_path(
     "MEDIA_ROOT",
     BASE_DIR / "media" / "static",
@@ -77,3 +76,34 @@ def _load_file_encryption_key() -> bytes:
 
 
 FILE_ENCRYPTION_KEY = _load_file_encryption_key()
+
+# Pooled URLs first. Vercel functions should not hold a direct Postgres connection.
+_DATABASE_URL_ENV_NAMES = (
+    "DB_DATABASE_URL_POOLED",
+    "DATABASE_URL_POOLED",
+    "POSTGRES_URL",
+    "DB_DATABASE_URL",
+    "DATABASE_URL",
+    "DB_POSTGRES_URL",
+    "POSTGRES_URL_NON_POOLING",
+    "DB_PRISMA_DATABASE_URL",
+    "PRISMA_DATABASE_URL",
+)
+
+
+def _normalize_database_url(url: str) -> str:
+    if url.startswith("postgres://"):
+        return "postgresql+psycopg://" + url[len("postgres://") :]
+    if url.startswith("postgresql://"):
+        return "postgresql+psycopg://" + url[len("postgresql://") :]
+    return url
+
+
+def database_url() -> tuple[str, str]:
+    for name in _DATABASE_URL_ENV_NAMES:
+        raw = os.getenv(name, "").strip().strip('"').strip("'")
+        if raw:
+            return name, _normalize_database_url(raw)
+    raise RuntimeError(
+        "Set DB_DATABASE_URL_POOLED or DATABASE_URL to the Prisma Postgres connection string."
+    )
